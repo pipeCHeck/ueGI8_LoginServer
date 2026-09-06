@@ -72,3 +72,9 @@ Plugins/**/Intermediate/*
 
 # Cache files for the editor to use
 DerivedDataCache/*
+
+# Python local environments and generated caches
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+*.py[cod]
