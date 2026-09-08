@@ -5,6 +5,7 @@
 #include "CoreMinimal.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "Interfaces/IHttpRequest.h"
+#include "TimerManager.h"
 #include "WebApiSubsystem.generated.h"
 
 class FJsonObject;
@@ -17,6 +18,20 @@ enum class ELoginGameServerParseResult : uint8
 	NotPresent,
 	Valid,
 	Invalid,
+};
+
+enum class EGameServerMaintenanceAction : uint8
+{
+	None,
+	Heartbeat,
+	RegistrationRetry,
+};
+
+enum class EGameServerHeartbeatResult : uint8
+{
+	Success,
+	NotRegistered,
+	TransientFailure,
 };
 
 struct FGameServerRegistrationResponse
@@ -45,6 +60,19 @@ bool TryParseGameServerRegistrationResponse(
 
 FString CreateHostingServerId();
 
+TSharedRef<FJsonObject> MakeGameServerIdentityRequestJson(const FString& InServerId);
+
+bool TryParseRegistrySuccessResponse(const TSharedPtr<FJsonObject>& InJsonObject);
+
+EGameServerMaintenanceAction GetGameServerMaintenanceAction(
+	bool bInRegistered,
+	bool bInHasValidHostingSession);
+
+EGameServerHeartbeatResult ClassifyGameServerHeartbeatResponse(
+	bool bInConnectedSuccessfully,
+	int32 InResponseCode,
+	const TSharedPtr<FJsonObject>& InJsonObject);
+
 /**
  * 웹서버와의 HTTP 통신을 전담한다. 결과는 델리게이트로만 알린다.
  */
@@ -67,6 +95,8 @@ public:
 
 	void StartGameServerRegistration(const FString& InWebServerIP, int32 InGameServerPort);
 
+	virtual void Deinitialize() override;
+
 private:
 
 	void SendAuthRequest(const FString& InServerIP, const FString& InPath,
@@ -82,6 +112,16 @@ private:
 		const FString& InExpectedServerId,
 		int32 InExpectedPort);
 
+	void SendGameServerRegistrationRequest();
+	void StartGameServerHeartbeatMaintenance();
+	void StopGameServerHeartbeatMaintenance();
+	void HandleGameServerMaintenanceTick();
+	void SendGameServerHeartbeat();
+	void HandleGameServerHeartbeatResponse(
+		FHttpResponsePtr InResponse,
+		bool bInConnectedSuccessfully);
+	bool HasValidHostingSession() const;
+
 	// Current process's hosting ID. This is separate from the login-discovered GameServerId.
 	FGuid HostingServerId;
 
@@ -91,8 +131,11 @@ private:
 
 	bool bRegistrationRequestInFlight = false;
 	bool bGameServerRegistered = false;
+	bool bHeartbeatRequestInFlight = false;
+	bool bIsDeinitializing = false;
 
-	// Values returned by register for the future heartbeat phase; no timer is started here.
+	// Registry lease values returned by register; the interval drives GameInstance-owned maintenance.
 	int32 HeartbeatIntervalSeconds = 0;
 	int32 RegistryTtlSeconds = 0;
+	FTimerHandle HeartbeatTimerHandle;
 };

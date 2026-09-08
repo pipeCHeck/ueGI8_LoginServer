@@ -9,6 +9,7 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
+#include "Engine/GameInstance.h"
 #include "../DataGameInstanceSubsystem.h"
 
 namespace
@@ -118,6 +119,58 @@ FString CreateHostingServerId()
 	return FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
 }
 
+TSharedRef<FJsonObject> MakeGameServerIdentityRequestJson(const FString& InServerId)
+{
+	TSharedRef<FJsonObject> JsonObject = MakeShared<FJsonObject>();
+	JsonObject->SetStringField(TEXT("server_id"), InServerId);
+	return JsonObject;
+}
+
+bool TryParseRegistrySuccessResponse(const TSharedPtr<FJsonObject>& InJsonObject)
+{
+	bool bResult = false;
+	return InJsonObject.IsValid()
+		&& InJsonObject->TryGetBoolField(TEXT("result"), bResult)
+		&& bResult;
+}
+
+EGameServerMaintenanceAction GetGameServerMaintenanceAction(
+	const bool bInRegistered,
+	const bool bInHasValidHostingSession)
+{
+	if (!bInHasValidHostingSession)
+	{
+		return EGameServerMaintenanceAction::None;
+	}
+
+	return bInRegistered
+		? EGameServerMaintenanceAction::Heartbeat
+		: EGameServerMaintenanceAction::RegistrationRetry;
+}
+
+EGameServerHeartbeatResult ClassifyGameServerHeartbeatResponse(
+	const bool bInConnectedSuccessfully,
+	const int32 InResponseCode,
+	const TSharedPtr<FJsonObject>& InJsonObject)
+{
+	if (!bInConnectedSuccessfully)
+	{
+		return EGameServerHeartbeatResult::TransientFailure;
+	}
+
+	if (InResponseCode == 404)
+	{
+		return EGameServerHeartbeatResult::NotRegistered;
+	}
+
+	if (InResponseCode == 200 && TryParseRegistrySuccessResponse(InJsonObject))
+	{
+		return EGameServerHeartbeatResult::Success;
+	}
+
+	return EGameServerHeartbeatResult::TransientFailure;
+}
+
 ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
 	const TSharedPtr<FJsonObject>& InJsonObject,
 	UDataGameInstanceSubsystem& InOutData)
@@ -181,6 +234,11 @@ void UWebApiSubsystem::StartGameServerRegistration(
 	const FString& InWebServerIP,
 	const int32 InGameServerPort)
 {
+	if (bIsDeinitializing)
+	{
+		return;
+	}
+
 	const FString TrimmedWebServerIP = InWebServerIP.TrimStartAndEnd();
 	if (TrimmedWebServerIP.IsEmpty() || InGameServerPort < 1 || InGameServerPort > 65535)
 	{
@@ -209,6 +267,26 @@ void UWebApiSubsystem::StartGameServerRegistration(
 	HeartbeatIntervalSeconds = 0;
 	RegistryTtlSeconds = 0;
 	bGameServerRegistered = false;
+	SendGameServerRegistrationRequest();
+}
+
+void UWebApiSubsystem::SendGameServerRegistrationRequest()
+{
+	if (bIsDeinitializing)
+	{
+		return;
+	}
+
+	if (bRegistrationRequestInFlight)
+	{
+		return;
+	}
+
+	if (!HasValidHostingSession())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 요청을 보낼 수 없습니다: hosting session이 올바르지 않습니다"));
+		return;
+	}
 
 	const FString HostingServerIdString = HostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower);
 	const TSharedRef<FJsonObject> JsonObject = MakeGameServerRegistrationRequestJson(
@@ -235,7 +313,7 @@ void UWebApiSubsystem::StartGameServerRegistration(
 			FHttpResponsePtr InResponse,
 			const bool bInConnectedSuccessfully)
 		{
-			if (!WeakThis.IsValid())
+			if (!WeakThis.IsValid() || WeakThis->bIsDeinitializing)
 			{
 				return;
 			}
@@ -250,6 +328,15 @@ void UWebApiSubsystem::StartGameServerRegistration(
 		bRegistrationRequestInFlight = false;
 		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 HTTP 요청을 시작하지 못했습니다"));
 	}
+}
+
+void UWebApiSubsystem::Deinitialize()
+{
+	bIsDeinitializing = true;
+	StopGameServerHeartbeatMaintenance();
+	bHeartbeatRequestInFlight = false;
+	bRegistrationRequestInFlight = false;
+	Super::Deinitialize();
 }
 
 void UWebApiSubsystem::SendAuthRequest(const FString& InServerIP, const FString& InPath,
@@ -350,8 +437,6 @@ void UWebApiSubsystem::HandleGameServerRegistrationResponse(
 	const int32 InExpectedPort)
 {
 	bGameServerRegistered = false;
-	HeartbeatIntervalSeconds = 0;
-	RegistryTtlSeconds = 0;
 
 	if (!bInConnectedSuccessfully || !InResponse.IsValid())
 	{
@@ -389,6 +474,7 @@ void UWebApiSubsystem::HandleGameServerRegistrationResponse(
 	bGameServerRegistered = true;
 	HeartbeatIntervalSeconds = Parsed.HeartbeatIntervalSeconds;
 	RegistryTtlSeconds = Parsed.TtlSeconds;
+	StartGameServerHeartbeatMaintenance();
 	UE_LOG(
 		LogTemp,
 		Log,
@@ -397,4 +483,166 @@ void UWebApiSubsystem::HandleGameServerRegistrationResponse(
 		Parsed.Port,
 		HeartbeatIntervalSeconds,
 		RegistryTtlSeconds);
+}
+
+bool UWebApiSubsystem::HasValidHostingSession() const
+{
+	return HostingServerId.IsValid()
+		&& !RegistryWebServerIP.TrimStartAndEnd().IsEmpty()
+		&& HostingGameServerPort >= 1
+		&& HostingGameServerPort <= 65535;
+}
+
+void UWebApiSubsystem::StartGameServerHeartbeatMaintenance()
+{
+	if (bIsDeinitializing || HeartbeatIntervalSeconds <= 0)
+	{
+		return;
+	}
+
+	UGameInstance* GameInstance = GetGameInstance();
+	if (GameInstance == nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("heartbeat maintenance를 시작할 수 없습니다: GameInstance가 없습니다"));
+		return;
+	}
+
+	FTimerManager& TimerManager = GameInstance->GetTimerManager();
+	TimerManager.ClearTimer(HeartbeatTimerHandle);
+	const float Interval = static_cast<float>(HeartbeatIntervalSeconds);
+	TimerManager.SetTimer(
+		HeartbeatTimerHandle,
+		this,
+		&UWebApiSubsystem::HandleGameServerMaintenanceTick,
+		Interval,
+		true,
+		Interval);
+}
+
+void UWebApiSubsystem::StopGameServerHeartbeatMaintenance()
+{
+	if (UGameInstance* GameInstance = GetGameInstance())
+	{
+		GameInstance->GetTimerManager().ClearTimer(HeartbeatTimerHandle);
+	}
+	else
+	{
+		HeartbeatTimerHandle.Invalidate();
+	}
+}
+
+void UWebApiSubsystem::HandleGameServerMaintenanceTick()
+{
+	const EGameServerMaintenanceAction Action = GetGameServerMaintenanceAction(
+		bGameServerRegistered, HasValidHostingSession());
+
+	switch (Action)
+	{
+	case EGameServerMaintenanceAction::Heartbeat:
+		SendGameServerHeartbeat();
+		break;
+
+	case EGameServerMaintenanceAction::RegistrationRetry:
+		SendGameServerRegistrationRequest();
+		break;
+
+	case EGameServerMaintenanceAction::None:
+	default:
+		break;
+	}
+}
+
+void UWebApiSubsystem::SendGameServerHeartbeat()
+{
+	if (bIsDeinitializing || bHeartbeatRequestInFlight || !HasValidHostingSession())
+	{
+		return;
+	}
+
+	const FString HostingServerIdString = HostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower);
+	const TSharedRef<FJsonObject> JsonObject = MakeGameServerIdentityRequestJson(HostingServerIdString);
+
+	FString Body;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Body);
+	FJsonSerializer::Serialize(JsonObject, Writer);
+
+	const FString Url = FString::Printf(
+		TEXT("http://%s:%d/game-servers/heartbeat"), *RegistryWebServerIP, WebServerPort);
+
+	FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Url);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetContentAsString(Body);
+
+	bHeartbeatRequestInFlight = true;
+	TWeakObjectPtr<UWebApiSubsystem> WeakThis(this);
+	Request->OnProcessRequestComplete().BindLambda(
+		[WeakThis](FHttpRequestPtr, FHttpResponsePtr InResponse, const bool bInConnectedSuccessfully)
+		{
+			if (!WeakThis.IsValid() || WeakThis->bIsDeinitializing)
+			{
+				return;
+			}
+
+			WeakThis->bHeartbeatRequestInFlight = false;
+			WeakThis->HandleGameServerHeartbeatResponse(InResponse, bInConnectedSuccessfully);
+		});
+
+	if (!Request->ProcessRequest())
+	{
+		bHeartbeatRequestInFlight = false;
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat HTTP 요청을 시작하지 못했습니다"));
+	}
+}
+
+void UWebApiSubsystem::HandleGameServerHeartbeatResponse(
+	FHttpResponsePtr InResponse,
+	const bool bInConnectedSuccessfully)
+{
+	const bool bHasResponse = InResponse.IsValid();
+	const int32 ResponseCode = bHasResponse ? InResponse->GetResponseCode() : 0;
+	TSharedPtr<FJsonObject> JsonObject;
+
+	if (bInConnectedSuccessfully && bHasResponse && ResponseCode == 200)
+	{
+		const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(InResponse->GetContentAsString());
+		FJsonSerializer::Deserialize(Reader, JsonObject);
+	}
+
+	const EGameServerHeartbeatResult Result = ClassifyGameServerHeartbeatResponse(
+		bInConnectedSuccessfully && bHasResponse, ResponseCode, JsonObject);
+
+	switch (Result)
+	{
+	case EGameServerHeartbeatResult::Success:
+		bGameServerRegistered = true;
+		return;
+
+	case EGameServerHeartbeatResult::NotRegistered:
+		bGameServerRegistered = false;
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat가 404를 반환했습니다: 같은 hosting UUID로 재등록합니다"));
+		SendGameServerRegistrationRequest();
+		return;
+
+	case EGameServerHeartbeatResult::TransientFailure:
+	default:
+		if (!bInConnectedSuccessfully || !bHasResponse)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat 실패: FastAPI 웹서버에 연결할 수 없습니다"));
+		}
+		else if (ResponseCode != 200)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat 실패: HTTP 상태 코드 %d"), ResponseCode);
+		}
+		else if (!JsonObject.IsValid())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat 실패: 응답 JSON을 해석할 수 없습니다"));
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat 실패: result가 true가 아닙니다"));
+		}
+		return;
+	}
 }
