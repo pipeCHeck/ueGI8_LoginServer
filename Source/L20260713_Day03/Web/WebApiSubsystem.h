@@ -34,6 +34,12 @@ enum class EGameServerHeartbeatResult : uint8
 	TransientFailure,
 };
 
+enum class EGameServerUnregisterResult : uint8
+{
+	Success,
+	Failure,
+};
+
 struct FGameServerRegistrationResponse
 {
 	FString ServerId;
@@ -73,6 +79,21 @@ EGameServerHeartbeatResult ClassifyGameServerHeartbeatResponse(
 	int32 InResponseCode,
 	const TSharedPtr<FJsonObject>& InJsonObject);
 
+EGameServerUnregisterResult ClassifyGameServerUnregisterResponse(
+	bool bInConnectedSuccessfully,
+	int32 InResponseCode,
+	const TSharedPtr<FJsonObject>& InJsonObject);
+
+bool IsValidGameServerHostingSession(
+	const FGuid& InHostingServerId,
+	const FString& InRegistryWebServerIP,
+	int32 InHostingGameServerPort);
+
+void ResetGameServerHostingSession(
+	FGuid& InOutHostingServerId,
+	FString& InOutRegistryWebServerIP,
+	int32& InOutHostingGameServerPort);
+
 /**
  * 웹서버와의 HTTP 통신을 전담한다. 결과는 델리게이트로만 알린다.
  */
@@ -94,6 +115,7 @@ public:
 	void RequestSignUp(const FString& InServerIP, const FString& InUserID, const FString& InPassword);
 
 	void StartGameServerRegistration(const FString& InWebServerIP, int32 InGameServerPort);
+	void StopGameServerRegistration();
 
 	virtual void Deinitialize() override;
 
@@ -113,6 +135,9 @@ private:
 		int32 InExpectedPort);
 
 	void SendGameServerRegistrationRequest();
+	void SendGameServerUnregisterRequest(
+		const FString& InRegistryWebServerIP,
+		const FString& InHostingServerId);
 	void StartGameServerHeartbeatMaintenance();
 	void StopGameServerHeartbeatMaintenance();
 	void HandleGameServerMaintenanceTick();
@@ -132,7 +157,10 @@ private:
 	bool bRegistrationRequestInFlight = false;
 	bool bGameServerRegistered = false;
 	bool bHeartbeatRequestInFlight = false;
+	bool bHostingShutdownRequested = false;
 	bool bIsDeinitializing = false;
+	FHttpRequestPtr ActiveRegistrationRequest;
+	FHttpRequestPtr ActiveHeartbeatRequest;
 
 	// Registry lease values returned by register; the interval drives GameInstance-owned maintenance.
 	int32 HeartbeatIntervalSeconds = 0;

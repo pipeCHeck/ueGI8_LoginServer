@@ -171,6 +171,39 @@ EGameServerHeartbeatResult ClassifyGameServerHeartbeatResponse(
 	return EGameServerHeartbeatResult::TransientFailure;
 }
 
+EGameServerUnregisterResult ClassifyGameServerUnregisterResponse(
+	const bool bInConnectedSuccessfully,
+	const int32 InResponseCode,
+	const TSharedPtr<FJsonObject>& InJsonObject)
+{
+	return bInConnectedSuccessfully
+		&& InResponseCode == 200
+		&& TryParseRegistrySuccessResponse(InJsonObject)
+		? EGameServerUnregisterResult::Success
+		: EGameServerUnregisterResult::Failure;
+}
+
+bool IsValidGameServerHostingSession(
+	const FGuid& InHostingServerId,
+	const FString& InRegistryWebServerIP,
+	const int32 InHostingGameServerPort)
+{
+	return InHostingServerId.IsValid()
+		&& !InRegistryWebServerIP.TrimStartAndEnd().IsEmpty()
+		&& InHostingGameServerPort >= 1
+		&& InHostingGameServerPort <= 65535;
+}
+
+void ResetGameServerHostingSession(
+	FGuid& InOutHostingServerId,
+	FString& InOutRegistryWebServerIP,
+	int32& InOutHostingGameServerPort)
+{
+	InOutHostingServerId = FGuid();
+	InOutRegistryWebServerIP.Reset();
+	InOutHostingGameServerPort = 0;
+}
+
 ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
 	const TSharedPtr<FJsonObject>& InJsonObject,
 	UDataGameInstanceSubsystem& InOutData)
@@ -257,6 +290,8 @@ void UWebApiSubsystem::StartGameServerRegistration(
 		return;
 	}
 
+	bHostingShutdownRequested = false;
+
 	if (!HostingServerId.IsValid())
 	{
 		FGuid::Parse(CreateHostingServerId(), HostingServerId);
@@ -272,7 +307,7 @@ void UWebApiSubsystem::StartGameServerRegistration(
 
 void UWebApiSubsystem::SendGameServerRegistrationRequest()
 {
-	if (bIsDeinitializing)
+	if (bIsDeinitializing || bHostingShutdownRequested)
 	{
 		return;
 	}
@@ -306,18 +341,25 @@ void UWebApiSubsystem::SendGameServerRegistrationRequest()
 	Request->SetContentAsString(Body);
 
 	bRegistrationRequestInFlight = true;
+	ActiveRegistrationRequest = Request;
 	TWeakObjectPtr<UWebApiSubsystem> WeakThis(this);
 	Request->OnProcessRequestComplete().BindLambda(
 		[WeakThis, HostingServerIdString, ExpectedPort = HostingGameServerPort](
-			FHttpRequestPtr,
+			FHttpRequestPtr InRequest,
 			FHttpResponsePtr InResponse,
 			const bool bInConnectedSuccessfully)
 		{
-			if (!WeakThis.IsValid() || WeakThis->bIsDeinitializing)
+			if (!WeakThis.IsValid()
+				|| WeakThis->bIsDeinitializing
+				|| WeakThis->bHostingShutdownRequested
+				|| WeakThis->ActiveRegistrationRequest != InRequest
+				|| WeakThis->HostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower)
+					!= HostingServerIdString)
 			{
 				return;
 			}
 
+			WeakThis->ActiveRegistrationRequest.Reset();
 			WeakThis->bRegistrationRequestInFlight = false;
 			WeakThis->HandleGameServerRegistrationResponse(
 				InResponse, bInConnectedSuccessfully, HostingServerIdString, ExpectedPort);
@@ -325,17 +367,127 @@ void UWebApiSubsystem::SendGameServerRegistrationRequest()
 
 	if (!Request->ProcessRequest())
 	{
+		ActiveRegistrationRequest.Reset();
 		bRegistrationRequestInFlight = false;
 		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 HTTP 요청을 시작하지 못했습니다"));
+	}
+}
+
+void UWebApiSubsystem::StopGameServerRegistration()
+{
+	// Block callbacks and maintenance before cancelling any in-flight work.
+	bHostingShutdownRequested = true;
+	StopGameServerHeartbeatMaintenance();
+
+	if (ActiveHeartbeatRequest.IsValid())
+	{
+		ActiveHeartbeatRequest->CancelRequest();
+		ActiveHeartbeatRequest.Reset();
+	}
+	if (ActiveRegistrationRequest.IsValid())
+	{
+		ActiveRegistrationRequest->CancelRequest();
+		ActiveRegistrationRequest.Reset();
+	}
+
+	const FGuid StoppedHostingServerId = HostingServerId;
+	const FString StoppedRegistryWebServerIP = RegistryWebServerIP;
+	const int32 StoppedHostingGameServerPort = HostingGameServerPort;
+
+	bHeartbeatRequestInFlight = false;
+	bRegistrationRequestInFlight = false;
+	bGameServerRegistered = false;
+	HeartbeatIntervalSeconds = 0;
+	RegistryTtlSeconds = 0;
+
+	if (IsValidGameServerHostingSession(
+		StoppedHostingServerId,
+		StoppedRegistryWebServerIP,
+		StoppedHostingGameServerPort))
+	{
+		SendGameServerUnregisterRequest(
+			StoppedRegistryWebServerIP,
+			StoppedHostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower));
+	}
+
+	// Clearing the identity also makes repeated Stop/Deinitialize calls idempotent.
+	ResetGameServerHostingSession(
+		HostingServerId,
+		RegistryWebServerIP,
+		HostingGameServerPort);
+}
+
+void UWebApiSubsystem::SendGameServerUnregisterRequest(
+	const FString& InRegistryWebServerIP,
+	const FString& InHostingServerId)
+{
+	const TSharedRef<FJsonObject> JsonObject = MakeGameServerIdentityRequestJson(InHostingServerId);
+
+	FString Body;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Body);
+	FJsonSerializer::Serialize(JsonObject, Writer);
+
+	const FString Url = FString::Printf(
+		TEXT("http://%s:%d/game-servers/unregister"), *InRegistryWebServerIP, WebServerPort);
+
+	FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Url);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetContentAsString(Body);
+
+	// The subsystem may already be gone when this best-effort request completes.
+	Request->OnProcessRequestComplete().BindLambda(
+		[](FHttpRequestPtr, FHttpResponsePtr InResponse, const bool bInConnectedSuccessfully)
+		{
+			const bool bHasResponse = InResponse.IsValid();
+			const int32 ResponseCode = bHasResponse ? InResponse->GetResponseCode() : 0;
+			TSharedPtr<FJsonObject> ResponseJson;
+
+			if (bInConnectedSuccessfully && bHasResponse && ResponseCode == 200)
+			{
+				const TSharedRef<TJsonReader<>> Reader =
+					TJsonReaderFactory<>::Create(InResponse->GetContentAsString());
+				FJsonSerializer::Deserialize(Reader, ResponseJson);
+			}
+
+			if (ClassifyGameServerUnregisterResponse(
+				bInConnectedSuccessfully && bHasResponse,
+				ResponseCode,
+				ResponseJson) == EGameServerUnregisterResult::Success)
+			{
+				UE_LOG(LogTemp, Log, TEXT("게임 서버 unregister 요청이 성공했습니다"));
+				return;
+			}
+
+			if (!bInConnectedSuccessfully || !bHasResponse)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("게임 서버 unregister 실패: FastAPI 웹서버에 연결할 수 없습니다"));
+			}
+			else if (ResponseCode != 200)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("게임 서버 unregister 실패: HTTP 상태 코드 %d"), ResponseCode);
+			}
+			else if (!ResponseJson.IsValid())
+			{
+				UE_LOG(LogTemp, Warning, TEXT("게임 서버 unregister 실패: 응답 JSON을 해석할 수 없습니다"));
+			}
+			else
+			{
+				UE_LOG(LogTemp, Warning, TEXT("게임 서버 unregister 실패: result가 true가 아닙니다"));
+			}
+		});
+
+	if (!Request->ProcessRequest())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 unregister HTTP 요청을 시작하지 못했습니다"));
 	}
 }
 
 void UWebApiSubsystem::Deinitialize()
 {
 	bIsDeinitializing = true;
-	StopGameServerHeartbeatMaintenance();
-	bHeartbeatRequestInFlight = false;
-	bRegistrationRequestInFlight = false;
+	StopGameServerRegistration();
 	Super::Deinitialize();
 }
 
@@ -487,15 +639,15 @@ void UWebApiSubsystem::HandleGameServerRegistrationResponse(
 
 bool UWebApiSubsystem::HasValidHostingSession() const
 {
-	return HostingServerId.IsValid()
-		&& !RegistryWebServerIP.TrimStartAndEnd().IsEmpty()
-		&& HostingGameServerPort >= 1
-		&& HostingGameServerPort <= 65535;
+	return IsValidGameServerHostingSession(
+		HostingServerId,
+		RegistryWebServerIP,
+		HostingGameServerPort);
 }
 
 void UWebApiSubsystem::StartGameServerHeartbeatMaintenance()
 {
-	if (bIsDeinitializing || HeartbeatIntervalSeconds <= 0)
+	if (bIsDeinitializing || bHostingShutdownRequested || HeartbeatIntervalSeconds <= 0)
 	{
 		return;
 	}
@@ -533,6 +685,11 @@ void UWebApiSubsystem::StopGameServerHeartbeatMaintenance()
 
 void UWebApiSubsystem::HandleGameServerMaintenanceTick()
 {
+	if (bIsDeinitializing || bHostingShutdownRequested)
+	{
+		return;
+	}
+
 	const EGameServerMaintenanceAction Action = GetGameServerMaintenanceAction(
 		bGameServerRegistered, HasValidHostingSession());
 
@@ -554,7 +711,10 @@ void UWebApiSubsystem::HandleGameServerMaintenanceTick()
 
 void UWebApiSubsystem::SendGameServerHeartbeat()
 {
-	if (bIsDeinitializing || bHeartbeatRequestInFlight || !HasValidHostingSession())
+	if (bIsDeinitializing
+		|| bHostingShutdownRequested
+		|| bHeartbeatRequestInFlight
+		|| !HasValidHostingSession())
 	{
 		return;
 	}
@@ -576,21 +736,32 @@ void UWebApiSubsystem::SendGameServerHeartbeat()
 	Request->SetContentAsString(Body);
 
 	bHeartbeatRequestInFlight = true;
+	ActiveHeartbeatRequest = Request;
 	TWeakObjectPtr<UWebApiSubsystem> WeakThis(this);
 	Request->OnProcessRequestComplete().BindLambda(
-		[WeakThis](FHttpRequestPtr, FHttpResponsePtr InResponse, const bool bInConnectedSuccessfully)
+		[WeakThis, HostingServerIdString](
+			FHttpRequestPtr InRequest,
+			FHttpResponsePtr InResponse,
+			const bool bInConnectedSuccessfully)
 		{
-			if (!WeakThis.IsValid() || WeakThis->bIsDeinitializing)
+			if (!WeakThis.IsValid()
+				|| WeakThis->bIsDeinitializing
+				|| WeakThis->bHostingShutdownRequested
+				|| WeakThis->ActiveHeartbeatRequest != InRequest
+				|| WeakThis->HostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower)
+					!= HostingServerIdString)
 			{
 				return;
 			}
 
+			WeakThis->ActiveHeartbeatRequest.Reset();
 			WeakThis->bHeartbeatRequestInFlight = false;
 			WeakThis->HandleGameServerHeartbeatResponse(InResponse, bInConnectedSuccessfully);
 		});
 
 	if (!Request->ProcessRequest())
 	{
+		ActiveHeartbeatRequest.Reset();
 		bHeartbeatRequestInFlight = false;
 		UE_LOG(LogTemp, Warning, TEXT("게임 서버 heartbeat HTTP 요청을 시작하지 못했습니다"));
 	}
