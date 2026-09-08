@@ -9,6 +9,18 @@
 #include "../DataGameInstanceSubsystem.h"
 #include "../Web/WebApiSubsystem.h"
 
+FString ResolveGameServerConnectionAddress(
+	const bool bInLoggedIn,
+	const UDataGameInstanceSubsystem& InData)
+{
+	if (!bInLoggedIn || !InData.HasValidGameServer())
+	{
+		return FString();
+	}
+
+	return InData.GetGameServerAddress();
+}
+
 void UTitleWidgetBase::NativeConstruct()
 {
 	Super::NativeConstruct();
@@ -63,16 +75,49 @@ void UTitleWidgetBase::StartServer()
 
 void UTitleWidgetBase::ConnectServer()
 {
-	if (!IsLoggedIn())
+	const bool bLoggedIn = IsLoggedIn();
+	UGameInstance* GI = GetGameInstance();
+	UDataGameInstanceSubsystem* Data = GI ? GI->GetSubsystem<UDataGameInstanceSubsystem>() : nullptr;
+	if (Data == nullptr)
+	{
+		SetInfoText(TEXT("게임 데이터에 접근할 수 없습니다"));
+		if (ConnectServerButton)
+		{
+			ConnectServerButton->SetIsEnabled(false);
+		}
+		return;
+	}
+
+	if (!bLoggedIn)
 	{
 		SetInfoText(TEXT("먼저 로그인해 주세요"));
 		return;
 	}
 
-	SaveData();
+	if (!Data->HasValidGameServer())
+	{
+		SetInfoText(TEXT("현재 접속 가능한 서버가 없습니다"));
+		if (ConnectServerButton)
+		{
+			ConnectServerButton->SetIsEnabled(false);
+		}
+		return;
+	}
 
+	const FString Address = ResolveGameServerConnectionAddress(bLoggedIn, *Data);
+	if (Address.IsEmpty())
+	{
+		SetInfoText(TEXT("현재 접속 가능한 서버가 없습니다"));
+		if (ConnectServerButton)
+		{
+			ConnectServerButton->SetIsEnabled(false);
+		}
+		return;
+	}
+
+	SaveData();
 	UGameplayStatics::OpenLevel(GetWorld(),
-		FName(ServerIP->GetText().ToString()),
+		FName(*Address),
 		true,
 		TEXT("Key=100")
 	);
@@ -157,10 +202,17 @@ void UTitleWidgetBase::ProcessLoginResult(const bool bInSuccess, const FString& 
 
 	UGameInstance* GI = GetGameInstance();
 	UDataGameInstanceSubsystem* Data = GI ? GI->GetSubsystem<UDataGameInstanceSubsystem>() : nullptr;
-	if (Data)
+	if (!Data)
 	{
-		SetInfoText(FString::Printf(TEXT("%s (Lv.%d)"), *Data->Nickname, Data->Level));
+		SetInfoText(TEXT("로그인 정보를 확인할 수 없습니다"));
+		return;
 	}
+
+	const bool bHasGameServer = !ResolveGameServerConnectionAddress(Data->bLoggedIn, *Data).IsEmpty();
+	const FString UserInfo = FString::Printf(TEXT("%s (Lv.%d)"), *Data->Nickname, Data->Level);
+	SetInfoText(bHasGameServer
+		? UserInfo
+		: UserInfo + TEXT(" - 현재 접속 가능한 서버가 없습니다"));
 
 	if (StartServerButton)
 	{
@@ -169,7 +221,7 @@ void UTitleWidgetBase::ProcessLoginResult(const bool bInSuccess, const FString& 
 
 	if (ConnectServerButton)
 	{
-		ConnectServerButton->SetIsEnabled(true);
+		ConnectServerButton->SetIsEnabled(bHasGameServer);
 	}
 }
 

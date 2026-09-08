@@ -10,7 +10,11 @@ class UButton;
 class UEditableTextBox;
 class UTextBlock;
 class UWebApiSubsystem;
+class UDataGameInstanceSubsystem;
 
+FString ResolveGameServerConnectionAddress(
+	bool bInLoggedIn,
+	const UDataGameInstanceSubsystem& InData);
 
 /**
  *
