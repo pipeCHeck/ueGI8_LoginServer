@@ -16,8 +16,57 @@ namespace
 	constexpr int32 WebServerPort = 8080;
 }
 
+ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
+	const TSharedPtr<FJsonObject>& InJsonObject,
+	UDataGameInstanceSubsystem& InOutData)
+{
+	InOutData.ClearGameServer();
+
+	if (!InJsonObject.IsValid())
+	{
+		return ELoginGameServerParseResult::Invalid;
+	}
+
+	const TSharedPtr<FJsonValue> GameServerValue = InJsonObject->TryGetField(TEXT("game_server"));
+	if (!GameServerValue.IsValid() || GameServerValue->IsNull())
+	{
+		return ELoginGameServerParseResult::NotPresent;
+	}
+
+	const TSharedPtr<FJsonObject>* GameServerObject = nullptr;
+	if (!InJsonObject->TryGetObjectField(TEXT("game_server"), GameServerObject)
+		|| GameServerObject == nullptr
+		|| !GameServerObject->IsValid())
+	{
+		return ELoginGameServerParseResult::Invalid;
+	}
+
+	FString ServerId;
+	FString Host;
+	int32 Port = 0;
+	if (!(*GameServerObject)->TryGetStringField(TEXT("server_id"), ServerId)
+		|| !(*GameServerObject)->TryGetStringField(TEXT("host"), Host)
+		|| !(*GameServerObject)->TryGetNumberField(TEXT("port"), Port))
+	{
+		return ELoginGameServerParseResult::Invalid;
+	}
+
+	InOutData.SetGameServer(Host, Port, ServerId);
+	return InOutData.HasValidGameServer()
+		? ELoginGameServerParseResult::Valid
+		: ELoginGameServerParseResult::Invalid;
+}
+
 void UWebApiSubsystem::RequestLogin(const FString& InServerIP, const FString& InUserID, const FString& InPassword)
 {
+	if (UGameInstance* GameInstance = GetGameInstance())
+	{
+		if (UDataGameInstanceSubsystem* Data = GameInstance->GetSubsystem<UDataGameInstanceSubsystem>())
+		{
+			Data->ClearGameServer();
+		}
+	}
+
 	SendAuthRequest(InServerIP, TEXT("/login"), InUserID, InPassword, OnLoginResult, true);
 }
 
@@ -106,6 +155,11 @@ void UWebApiSubsystem::HandleAuthResponse(FHttpResponsePtr InResponse, const boo
 			Data->Nickname = JsonObject->GetStringField(TEXT("nickname"));
 			Data->Level = JsonObject->GetIntegerField(TEXT("level"));
 			Data->bLoggedIn = true;
+
+			if (ApplyGameServerFromLoginResponse(JsonObject, *Data) == ELoginGameServerParseResult::Invalid)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("로그인 응답의 game_server 정보가 올바르지 않습니다"));
+			}
 		}
 	}
 

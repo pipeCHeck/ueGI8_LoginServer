@@ -7,7 +7,21 @@
 #include "Interfaces/IHttpRequest.h"
 #include "WebApiSubsystem.generated.h"
 
+class FJsonObject;
+class UDataGameInstanceSubsystem;
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FWebApiResultSignature, const bool, bInSuccess, const FString&, InMessage);
+
+enum class ELoginGameServerParseResult : uint8
+{
+	NotPresent,
+	Valid,
+	Invalid,
+};
+
+ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
+	const TSharedPtr<FJsonObject>& InJsonObject,
+	UDataGameInstanceSubsystem& InOutData);
 
 /**
  * 웹서버와의 HTTP 통신을 전담한다. 결과는 델리게이트로만 알린다.
