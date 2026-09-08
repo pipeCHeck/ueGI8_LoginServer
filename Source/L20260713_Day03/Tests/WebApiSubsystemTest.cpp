@@ -10,7 +10,7 @@
 
 namespace
 {
-	UDataGameInstanceSubsystem* CreateDataSubsystem()
+	UDataGameInstanceSubsystem* CreateWebApiDataSubsystem()
 	{
 		UGameInstance* GameInstance = NewObject<UGameInstance>();
 		return NewObject<UDataGameInstanceSubsystem>(GameInstance);
@@ -57,7 +57,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FWebApiValidGameServerResponseTest::RunTest(const FString& Parameters)
 {
-	UDataGameInstanceSubsystem* Data = CreateDataSubsystem();
+	UDataGameInstanceSubsystem* Data = CreateWebApiDataSubsystem();
 	const TSharedRef<FJsonObject> LoginResponse = MakeLoginResponse(MakeValidGameServer());
 
 	const ELoginGameServerParseResult Result = ApplyGameServerFromLoginResponse(LoginResponse, *Data);
@@ -85,7 +85,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FWebApiNullGameServerResponseTest::RunTest(const FString& Parameters)
 {
-	UDataGameInstanceSubsystem* Data = CreateDataSubsystem();
+	UDataGameInstanceSubsystem* Data = CreateWebApiDataSubsystem();
 	SetStaleGameServer(*Data);
 	TSharedRef<FJsonObject> LoginResponse = MakeShared<FJsonObject>();
 	LoginResponse->SetField(TEXT("game_server"), MakeShared<FJsonValueNull>());
@@ -105,7 +105,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FWebApiMissingGameServerResponseTest::RunTest(const FString& Parameters)
 {
-	UDataGameInstanceSubsystem* Data = CreateDataSubsystem();
+	UDataGameInstanceSubsystem* Data = CreateWebApiDataSubsystem();
 	SetStaleGameServer(*Data);
 	const TSharedRef<FJsonObject> LoginResponse = MakeShared<FJsonObject>();
 
@@ -124,7 +124,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FWebApiInvalidGameServerResponseTest::RunTest(const FString& Parameters)
 {
-	UDataGameInstanceSubsystem* Data = CreateDataSubsystem();
+	UDataGameInstanceSubsystem* Data = CreateWebApiDataSubsystem();
 
 	auto TestInvalidGameServer = [this, Data](const TCHAR* CaseName, const TSharedRef<FJsonObject>& GameServer)
 		{

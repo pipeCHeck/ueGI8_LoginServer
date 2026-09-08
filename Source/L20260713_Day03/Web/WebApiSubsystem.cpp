@@ -14,6 +14,108 @@
 namespace
 {
 	constexpr int32 WebServerPort = 8080;
+
+	bool FailGameServerRegistrationParse(
+		FGameServerRegistrationResponse& OutResponse,
+		FString* OutError,
+		const TCHAR* Error)
+	{
+		OutResponse = FGameServerRegistrationResponse();
+		if (OutError != nullptr)
+		{
+			*OutError = Error;
+		}
+		return false;
+	}
+}
+
+TSharedRef<FJsonObject> MakeGameServerRegistrationRequestJson(
+	const FString& InServerId,
+	const int32 InPort)
+{
+	TSharedRef<FJsonObject> JsonObject = MakeShared<FJsonObject>();
+	JsonObject->SetStringField(TEXT("server_id"), InServerId);
+	JsonObject->SetNumberField(TEXT("port"), InPort);
+	return JsonObject;
+}
+
+bool TryParseGameServerRegistrationResponse(
+	const TSharedPtr<FJsonObject>& InJsonObject,
+	const FString& InExpectedServerId,
+	const int32 InExpectedPort,
+	FGameServerRegistrationResponse& OutResponse,
+	FString* OutError)
+{
+	OutResponse = FGameServerRegistrationResponse();
+	if (OutError != nullptr)
+	{
+		OutError->Reset();
+	}
+
+	if (!InJsonObject.IsValid())
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("JSON object is missing"));
+	}
+
+	bool bResult = false;
+	if (!InJsonObject->TryGetBoolField(TEXT("result"), bResult) || !bResult)
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("result is missing or false"));
+	}
+
+	FGameServerRegistrationResponse Parsed;
+	if (!InJsonObject->TryGetStringField(TEXT("server_id"), Parsed.ServerId))
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("server_id is missing"));
+	}
+	if (Parsed.ServerId != InExpectedServerId)
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("server_id does not match the hosting session"));
+	}
+
+	if (!InJsonObject->TryGetStringField(TEXT("host"), Parsed.Host)
+		|| Parsed.Host.TrimStartAndEnd().IsEmpty())
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("host is missing or empty"));
+	}
+
+	if (!InJsonObject->TryGetNumberField(TEXT("port"), Parsed.Port)
+		|| Parsed.Port < 1
+		|| Parsed.Port > 65535)
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("port is missing or out of range"));
+	}
+	if (Parsed.Port != InExpectedPort)
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("port does not match the Listen Server port"));
+	}
+
+	if (!InJsonObject->TryGetNumberField(
+		TEXT("heartbeat_interval_seconds"), Parsed.HeartbeatIntervalSeconds)
+		|| Parsed.HeartbeatIntervalSeconds <= 0)
+	{
+		return FailGameServerRegistrationParse(
+			OutResponse, OutError, TEXT("heartbeat_interval_seconds is missing or invalid"));
+	}
+
+	if (!InJsonObject->TryGetNumberField(TEXT("ttl_seconds"), Parsed.TtlSeconds)
+		|| Parsed.TtlSeconds <= 0)
+	{
+		return FailGameServerRegistrationParse(OutResponse, OutError, TEXT("ttl_seconds is missing or invalid"));
+	}
+	if (Parsed.HeartbeatIntervalSeconds >= Parsed.TtlSeconds)
+	{
+		return FailGameServerRegistrationParse(
+			OutResponse, OutError, TEXT("heartbeat interval must be lower than TTL"));
+	}
+
+	OutResponse = MoveTemp(Parsed);
+	return true;
+}
+
+FString CreateHostingServerId()
+{
+	return FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphensLower);
 }
 
 ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
@@ -73,6 +175,81 @@ void UWebApiSubsystem::RequestLogin(const FString& InServerIP, const FString& In
 void UWebApiSubsystem::RequestSignUp(const FString& InServerIP, const FString& InUserID, const FString& InPassword)
 {
 	SendAuthRequest(InServerIP, TEXT("/signup"), InUserID, InPassword, OnSignUpResult, false);
+}
+
+void UWebApiSubsystem::StartGameServerRegistration(
+	const FString& InWebServerIP,
+	const int32 InGameServerPort)
+{
+	const FString TrimmedWebServerIP = InWebServerIP.TrimStartAndEnd();
+	if (TrimmedWebServerIP.IsEmpty() || InGameServerPort < 1 || InGameServerPort > 65535)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록을 시작할 수 없습니다: FastAPI 주소 또는 Listen 포트가 올바르지 않습니다"));
+		return;
+	}
+
+	if (bRegistrationRequestInFlight)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 요청이 이미 진행 중입니다"));
+		return;
+	}
+
+	if (bGameServerRegistered)
+	{
+		return;
+	}
+
+	if (!HostingServerId.IsValid())
+	{
+		FGuid::Parse(CreateHostingServerId(), HostingServerId);
+	}
+
+	RegistryWebServerIP = TrimmedWebServerIP;
+	HostingGameServerPort = InGameServerPort;
+	HeartbeatIntervalSeconds = 0;
+	RegistryTtlSeconds = 0;
+	bGameServerRegistered = false;
+
+	const FString HostingServerIdString = HostingServerId.ToString(EGuidFormats::DigitsWithHyphensLower);
+	const TSharedRef<FJsonObject> JsonObject = MakeGameServerRegistrationRequestJson(
+		HostingServerIdString, HostingGameServerPort);
+
+	FString Body;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Body);
+	FJsonSerializer::Serialize(JsonObject, Writer);
+
+	const FString Url = FString::Printf(
+		TEXT("http://%s:%d/game-servers/register"), *RegistryWebServerIP, WebServerPort);
+
+	FHttpRequestRef Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(Url);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetContentAsString(Body);
+
+	bRegistrationRequestInFlight = true;
+	TWeakObjectPtr<UWebApiSubsystem> WeakThis(this);
+	Request->OnProcessRequestComplete().BindLambda(
+		[WeakThis, HostingServerIdString, ExpectedPort = HostingGameServerPort](
+			FHttpRequestPtr,
+			FHttpResponsePtr InResponse,
+			const bool bInConnectedSuccessfully)
+		{
+			if (!WeakThis.IsValid())
+			{
+				return;
+			}
+
+			WeakThis->bRegistrationRequestInFlight = false;
+			WeakThis->HandleGameServerRegistrationResponse(
+				InResponse, bInConnectedSuccessfully, HostingServerIdString, ExpectedPort);
+		});
+
+	if (!Request->ProcessRequest())
+	{
+		bRegistrationRequestInFlight = false;
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 HTTP 요청을 시작하지 못했습니다"));
+	}
 }
 
 void UWebApiSubsystem::SendAuthRequest(const FString& InServerIP, const FString& InPath,
@@ -164,4 +341,60 @@ void UWebApiSubsystem::HandleAuthResponse(FHttpResponsePtr InResponse, const boo
 	}
 
 	InDelegate.Broadcast(true, TEXT(""));
+}
+
+void UWebApiSubsystem::HandleGameServerRegistrationResponse(
+	FHttpResponsePtr InResponse,
+	const bool bInConnectedSuccessfully,
+	const FString& InExpectedServerId,
+	const int32 InExpectedPort)
+{
+	bGameServerRegistered = false;
+	HeartbeatIntervalSeconds = 0;
+	RegistryTtlSeconds = 0;
+
+	if (!bInConnectedSuccessfully || !InResponse.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 실패: FastAPI 웹서버에 연결할 수 없습니다"));
+		return;
+	}
+
+	if (InResponse->GetResponseCode() != 200)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("게임 서버 등록 실패: HTTP 상태 코드 %d"),
+			InResponse->GetResponseCode());
+		return;
+	}
+
+	TSharedPtr<FJsonObject> JsonObject;
+	const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(InResponse->GetContentAsString());
+	if (!FJsonSerializer::Deserialize(Reader, JsonObject) || !JsonObject.IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 실패: 응답 JSON을 해석할 수 없습니다"));
+		return;
+	}
+
+	FGameServerRegistrationResponse Parsed;
+	FString ValidationError;
+	if (!TryParseGameServerRegistrationResponse(
+		JsonObject, InExpectedServerId, InExpectedPort, Parsed, &ValidationError))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("게임 서버 등록 실패: %s"), *ValidationError);
+		return;
+	}
+
+	bGameServerRegistered = true;
+	HeartbeatIntervalSeconds = Parsed.HeartbeatIntervalSeconds;
+	RegistryTtlSeconds = Parsed.TtlSeconds;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("게임 서버 등록 성공: %s:%d (heartbeat=%d, ttl=%d)"),
+		*Parsed.Host,
+		Parsed.Port,
+		HeartbeatIntervalSeconds,
+		RegistryTtlSeconds);
 }

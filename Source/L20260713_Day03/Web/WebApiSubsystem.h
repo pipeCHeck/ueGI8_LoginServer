@@ -19,9 +19,31 @@ enum class ELoginGameServerParseResult : uint8
 	Invalid,
 };
 
+struct FGameServerRegistrationResponse
+{
+	FString ServerId;
+	FString Host;
+	int32 Port = 0;
+	int32 HeartbeatIntervalSeconds = 0;
+	int32 TtlSeconds = 0;
+};
+
 ELoginGameServerParseResult ApplyGameServerFromLoginResponse(
 	const TSharedPtr<FJsonObject>& InJsonObject,
 	UDataGameInstanceSubsystem& InOutData);
+
+TSharedRef<FJsonObject> MakeGameServerRegistrationRequestJson(
+	const FString& InServerId,
+	int32 InPort);
+
+bool TryParseGameServerRegistrationResponse(
+	const TSharedPtr<FJsonObject>& InJsonObject,
+	const FString& InExpectedServerId,
+	int32 InExpectedPort,
+	FGameServerRegistrationResponse& OutResponse,
+	FString* OutError = nullptr);
+
+FString CreateHostingServerId();
 
 /**
  * 웹서버와의 HTTP 통신을 전담한다. 결과는 델리게이트로만 알린다.
@@ -43,6 +65,8 @@ public:
 
 	void RequestSignUp(const FString& InServerIP, const FString& InUserID, const FString& InPassword);
 
+	void StartGameServerRegistration(const FString& InWebServerIP, int32 InGameServerPort);
+
 private:
 
 	void SendAuthRequest(const FString& InServerIP, const FString& InPath,
@@ -51,4 +75,24 @@ private:
 
 	void HandleAuthResponse(FHttpResponsePtr InResponse, const bool bInConnectedSuccessfully,
 		FWebApiResultSignature& InDelegate, const bool bInIsLogin);
+
+	void HandleGameServerRegistrationResponse(
+		FHttpResponsePtr InResponse,
+		bool bInConnectedSuccessfully,
+		const FString& InExpectedServerId,
+		int32 InExpectedPort);
+
+	// Current process's hosting ID. This is separate from the login-discovered GameServerId.
+	FGuid HostingServerId;
+
+	// FastAPI registry address and the actual port bound by this Listen Server.
+	FString RegistryWebServerIP;
+	int32 HostingGameServerPort = 0;
+
+	bool bRegistrationRequestInFlight = false;
+	bool bGameServerRegistered = false;
+
+	// Values returned by register for the future heartbeat phase; no timer is started here.
+	int32 HeartbeatIntervalSeconds = 0;
+	int32 RegistryTtlSeconds = 0;
 };

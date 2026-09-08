@@ -5,6 +5,10 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "LobbyGS.h"
 #include "LobbyPC.h"
+#include "Engine/GameInstance.h"
+#include "Engine/NetDriver.h"
+#include "../DataGameInstanceSubsystem.h"
+#include "../Web/WebApiSubsystem.h"
 
 void ALobbyGM::PreLogin(const FString& Options, const FString& Address, const FUniqueNetIdRepl& UniqueId, FString& ErrorMessage)
 {
@@ -53,6 +57,55 @@ void ALobbyGM::StartPlay()
 	//UKismetSystemLibrary::PrintString(GetWorld(), TEXT("ALobbyGM::StartPlay Begin"));
 
 	Super::StartPlay();
+
+	if (GetNetMode() != NM_ListenServer)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: Lobby World is unavailable"));
+		return;
+	}
+
+	UNetDriver* NetDriver = World->GetNetDriver();
+	if (NetDriver == nullptr || !NetDriver->GetLocalAddr().IsValid())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: active NetDriver has no local address"));
+		return;
+	}
+
+	const int32 ListenPort = NetDriver->GetLocalAddr()->GetPort();
+	if (ListenPort < 1 || ListenPort > 65535)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: bound Listen port is invalid"));
+		return;
+	}
+
+	UGameInstance* GameInstance = World->GetGameInstance();
+	if (GameInstance == nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: GameInstance is unavailable"));
+		return;
+	}
+
+	UDataGameInstanceSubsystem* Data = GameInstance->GetSubsystem<UDataGameInstanceSubsystem>();
+	if (Data == nullptr || Data->ServerIP.TrimStartAndEnd().IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: FastAPI address is empty"));
+		return;
+	}
+
+	UWebApiSubsystem* WebApi = GameInstance->GetSubsystem<UWebApiSubsystem>();
+	if (WebApi == nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Skipping game server registration: WebApiSubsystem is unavailable"));
+		return;
+	}
+
+	WebApi->StartGameServerRegistration(Data->ServerIP, ListenPort);
 
 	//UKismetSystemLibrary::PrintString(GetWorld(), TEXT("ALobbyGM::StartPlay End"));
 }
