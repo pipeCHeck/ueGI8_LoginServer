@@ -24,6 +24,39 @@ import db as db_module
 import main as main_module
 
 
+def test_get_connection_requires_database_password_environment_variable(monkeypatch):
+    monkeypatch.delenv("L20260713_DB_PASSWORD", raising=False)
+
+    def unexpected_connect(**kwargs):
+        pytest.fail("pymysql.connect must not run without the password environment variable")
+
+    monkeypatch.setattr(db_module.pymysql, "connect", unexpected_connect)
+
+    with pytest.raises(RuntimeError, match="L20260713_DB_PASSWORD"):
+        db_module.get_connection()
+
+
+def test_get_connection_uses_database_password_environment_variable(monkeypatch):
+    expected_password = "unit-test-password"
+    captured = {}
+    sentinel_connection = object()
+    monkeypatch.setenv("L20260713_DB_PASSWORD", expected_password)
+
+    def capture_connect(**kwargs):
+        captured.update(kwargs)
+        return sentinel_connection
+
+    monkeypatch.setattr(db_module.pymysql, "connect", capture_connect)
+
+    connection = db_module.get_connection()
+
+    assert connection is sentinel_connection
+    if "password" in db_module.DB_CONFIG:
+        pytest.fail("DB_CONFIG must not contain a source-controlled password")
+    if captured.get("password") != expected_password:
+        pytest.fail("get_connection did not use the password environment variable")
+
+
 class ClientAddressApp:
     def __init__(self, app, host):
         self.app = app
